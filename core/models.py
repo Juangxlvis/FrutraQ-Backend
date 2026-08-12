@@ -167,3 +167,89 @@ class LoteCarga(models.Model):
 
     def __str__(self):
         return f"{self.producto} · {self.calidad} · {self.num_canastillas} canastillas"
+
+class Entrega(models.Model):
+    """Entrega de fruta a un cliente en destino (Bogotá)."""
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    viaje = models.ForeignKey(Viaje, on_delete=models.CASCADE, related_name='entregas')
+    cliente = models.ForeignKey(Cliente, on_delete=models.PROTECT)
+    fecha_entrega = models.DateField(default=date.today)
+    estado_pago = models.CharField(
+        max_length=10, choices=EstadoPago.choices, default=EstadoPago.PENDIENTE
+    )
+    notas = models.TextField(blank=True)
+    creado_en = models.DateTimeField(auto_now_add=True)
+
+    @property
+    def total(self):
+        from django.db.models import Sum
+        return self.detalles.aggregate(total=Sum('subtotal'))['total'] or Decimal('0.00')
+
+    def __str__(self):
+        return f"Entrega {self.cliente} — {self.fecha_entrega}"
+
+
+class DetalleEntrega(models.Model):
+    """
+    *** MODELO MÁS IMPORTANTE DEL SISTEMA ***
+    Registra los kg que EL CLIENTE pesa y clasifica en destino — determinan el pago real.
+    """
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    entrega = models.ForeignKey(Entrega, on_delete=models.CASCADE, related_name='detalles')
+    producto = models.ForeignKey(Producto, on_delete=models.PROTECT)
+
+    kg_primera_recibida = models.DecimalField(max_digits=8, decimal_places=2, default=Decimal('0.00'))
+    kg_segunda_recibida = models.DecimalField(max_digits=8, decimal_places=2, default=Decimal('0.00'))
+
+    # Snapshot — NO son ForeignKey a PrecioCliente
+    precio_primera_kg = models.DecimalField(max_digits=10, decimal_places=2, default=Decimal('0.00'), blank=True)
+    precio_segunda_kg = models.DecimalField(max_digits=10, decimal_places=2, default=Decimal('0.00'), blank=True)
+
+    subtotal = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal('0.00'))
+
+    def save(self, *args, **kwargs):
+        self.subtotal = (
+            self.kg_primera_recibida * self.precio_primera_kg +
+            self.kg_segunda_recibida * self.precio_segunda_kg
+        )
+        super().save(*args, **kwargs)
+
+    def clean(self):
+        if self.kg_primera_recibida < 0 or self.kg_segunda_recibida < 0:
+            raise ValidationError('Los kilogramos no pueden ser negativos.')
+        if self.kg_primera_recibida == 0 and self.kg_segunda_recibida == 0:
+            raise ValidationError('Debe ingresar al menos kg de primera o de segunda.')
+        if self.kg_primera_recibida > 0 and self.precio_primera_kg <= 0:
+            raise ValidationError('Se requiere un precio de primera válido si hay kg de primera.')
+        if self.kg_segunda_recibida > 0 and self.precio_segunda_kg <= 0:
+            raise ValidationError('Se requiere un precio de segunda válido si hay kg de segunda.')
+
+    def __str__(self):
+        return f"{self.producto} — subtotal ${self.subtotal}"
+
+
+class Factura(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    entrega = models.OneToOneField(Entrega, on_delete=models.CASCADE, related_name='factura')
+    numero_factura = models.CharField(max_length=20, unique=True, blank=True)
+    fecha_emision = models.DateField(auto_now_add=True)
+    total = models.DecimalField(max_digits=12, decimal_places=2, blank=True)
+    notas = models.TextField(blank=True)
+    pdf_url = models.CharField(max_length=500, blank=True)
+    creado_en = models.DateTimeField(auto_now_add=True)
+
+    def save(self, *args, **kwargs):
+        if not self.numero_factura:
+            self.numero_factura = self._generar_numero()
+        if not self.total:
+            self.total = self.entrega.total
+        super().save(*args, **kwargs)
+
+    @staticmethod
+    def _generar_numero():
+        anio = date.today().year
+        ultimo = Factura.objects.filter(numero_factura__startswith=f'FAC-{anio}-').count()
+        return f'FAC-{anio}-{str(ultimo + 1).zfill(4)}'
+
+    def __str__(self):
+        return self.numero_factura
