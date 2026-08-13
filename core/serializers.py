@@ -62,7 +62,7 @@ class ViajeSerializer(serializers.ModelSerializer):
         total = DetalleEntrega.objects.filter(
             entrega__viaje=obj
         ).aggregate(t=Sum('subtotal'))['t']
-        return total or Decimal('0.00')
+        return str(total or Decimal('0.00'))
 
 
 class PuntoRecoleccionSerializer(serializers.ModelSerializer):
@@ -109,7 +109,7 @@ class LoteCargaSerializer(serializers.ModelSerializer):
         return value
 
 class EntregaSerializer(serializers.ModelSerializer):
-    total = serializers.ReadOnlyField()
+    total = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
 
     class Meta:
         model = Entrega
