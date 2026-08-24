@@ -39,6 +39,9 @@ class Producto(models.Model):
     activo = models.BooleanField(default=True)
     creado_en = models.DateTimeField(auto_now_add=True)
 
+    class Meta:
+        ordering = ['nombre']
+
     def __str__(self):
         return self.nombre
 
@@ -54,6 +57,9 @@ class Proveedor(models.Model):
     )
     activo = models.BooleanField(default=True)
     notas = models.TextField(blank=True)
+
+    class Meta:
+        ordering = ['nombre']
 
     def __str__(self):
         return f"{self.nombre} — {self.vereda}"
@@ -110,6 +116,9 @@ class Viaje(models.Model):
     observaciones = models.TextField(blank=True)
     creado_en = models.DateTimeField(auto_now_add=True)
     actualizado_en = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-fecha_salida', '-creado_en']
 
     def __str__(self):
         return f"Viaje {self.fecha_salida} — {self.get_vehiculo_display()}"
