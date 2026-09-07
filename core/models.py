@@ -5,7 +5,6 @@ from datetime import date
 from django.core.exceptions import ValidationError
 
 
-
 class Calidad(models.TextChoices):
     PRIMERA = '1RA', 'Primera'
     SEGUNDA = '2DA', 'Segunda'
@@ -32,6 +31,28 @@ class EstadoPago(models.TextChoices):
     PENDIENTE = 'PENDIENTE', 'Pendiente'
     PAGADO = 'PAGADO', 'Pagado'
 
+
+class Configuracion(models.Model):
+    margen_flete_kg_defecto = models.DecimalField(
+        max_digits=8, decimal_places=2, default=Decimal('500.00'),
+        help_text='Margen por kg que se precarga en entregas de paradas tipo FLETE — la ganancia del transportador, calculada al momento de entregar.'
+    )
+
+    class Meta:
+        verbose_name = 'Configuración general'
+        verbose_name_plural = 'Configuración general'
+
+    def save(self, *args, **kwargs):
+        self.pk = 1
+        super().save(*args, **kwargs)
+
+    @classmethod
+    def obtener(cls):
+        obj, _ = cls.objects.get_or_create(pk=1)
+        return obj
+
+    def __str__(self):
+        return 'Configuración general'
 
 class Producto(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
@@ -75,8 +96,12 @@ class Cliente(models.Model):
     activo = models.BooleanField(default=True)
     notas = models.TextField(blank=True)
 
+    class Meta:
+        ordering = ['nombre']
+
     def __str__(self):
         return self.nombre
+
 
 class PrecioCliente(models.Model):
     """
@@ -125,30 +150,23 @@ class Viaje(models.Model):
 
 
 class PuntoRecoleccion(models.Model):
-    """Una parada del viaje donde se recoge fruta de un proveedor."""
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     viaje = models.ForeignKey(Viaje, on_delete=models.CASCADE, related_name='puntos')
     proveedor = models.ForeignKey(Proveedor, on_delete=models.PROTECT)
     orden = models.PositiveSmallIntegerField()
     tipo_servicio = models.CharField(max_length=10, choices=TipoServicio.choices)
-    precio_flete_kg = models.DecimalField(
-        max_digits=8, decimal_places=2, null=True, blank=True
+    margen_flete_kg = models.DecimalField(
+        max_digits=8, decimal_places=2, null=True, blank=True,
+        help_text='Margen acordado por kg cuando el tipo es FLETE. Si queda vacío, se usa el valor por defecto de Configuración al momento de entregar.'
     )
 
     class Meta:
         ordering = ['orden']
         unique_together = [('viaje', 'orden')]
 
-    def clean(self):
-        if self.tipo_servicio == TipoServicio.FLETE and not self.precio_flete_kg:
-            raise ValidationError('Se requiere precio_flete_kg cuando el tipo es FLETE.')
-        if self.tipo_servicio == TipoServicio.COMPRA:
-            self.precio_flete_kg = None
-
     def __str__(self):
         return f"{self.viaje} · parada {self.orden} · {self.proveedor}"
-
-
+    
 class LoteCarga(models.Model):
     """
     Grupo de canastillas del mismo producto y calidad en un punto de recolección.
@@ -177,6 +195,7 @@ class LoteCarga(models.Model):
     def __str__(self):
         return f"{self.producto} · {self.calidad} · {self.num_canastillas} canastillas"
 
+
 class Entrega(models.Model):
     """Entrega de fruta a un cliente en destino (Bogotá)."""
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
@@ -199,12 +218,13 @@ class Entrega(models.Model):
 
 
 class DetalleEntrega(models.Model):
-    """
-    *** MODELO MÁS IMPORTANTE DEL SISTEMA ***
-    Registra los kg que EL CLIENTE pesa y clasifica en destino — determinan el pago real.
-    """
+    
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     entrega = models.ForeignKey(Entrega, on_delete=models.CASCADE, related_name='detalles')
+    punto_recoleccion = models.ForeignKey(
+        PuntoRecoleccion, on_delete=models.PROTECT, related_name='detalles_entrega',
+        null=True,  # nulo solo por compatibilidad con registros creados antes de este cambio
+    )
     producto = models.ForeignKey(Producto, on_delete=models.PROTECT)
 
     kg_primera_recibida = models.DecimalField(max_digits=8, decimal_places=2, default=Decimal('0.00'))
@@ -216,12 +236,29 @@ class DetalleEntrega(models.Model):
 
     subtotal = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal('0.00'))
 
+    # Ganancia por kg del transportador — solo aplica en paradas tipo COMPRA (0 en FLETE)
+    margen_kg = models.DecimalField(max_digits=8, decimal_places=2, default=Decimal('0.00'), blank=True)
+
     def save(self, *args, **kwargs):
         self.subtotal = (
             self.kg_primera_recibida * self.precio_primera_kg +
             self.kg_segunda_recibida * self.precio_segunda_kg
         )
         super().save(*args, **kwargs)
+
+    @property
+    def subtotal_proveedor(self):
+        """
+        Cuánto se le paga al proveedor por esta línea — solo aplica en
+        paradas FLETE, donde la tajada del transportador se descuenta
+        recién al momento de la entrega (no se sabe antes). En COMPRA,
+        el proveedor ya cobró un precio fijo en la recolección
+        (LoteCarga.precio_compra_kg) — no depende de esta línea.
+        """
+        if not self.punto_recoleccion_id or self.punto_recoleccion.tipo_servicio != TipoServicio.FLETE:
+            return None
+        total_kg = self.kg_primera_recibida + self.kg_segunda_recibida
+        return self.subtotal - (self.margen_kg * total_kg)
 
     def clean(self):
         if self.kg_primera_recibida < 0 or self.kg_segunda_recibida < 0:
@@ -232,6 +269,9 @@ class DetalleEntrega(models.Model):
             raise ValidationError('Se requiere un precio de primera válido si hay kg de primera.')
         if self.kg_segunda_recibida > 0 and self.precio_segunda_kg <= 0:
             raise ValidationError('Se requiere un precio de segunda válido si hay kg de segunda.')
+        if self.punto_recoleccion_id and self.entrega_id:
+            if self.punto_recoleccion.viaje_id != self.entrega.viaje_id:
+                raise ValidationError('La parada debe pertenecer al mismo viaje que la entrega.')
 
     def __str__(self):
         return f"{self.producto} — subtotal ${self.subtotal}"
@@ -253,6 +293,9 @@ class Factura(models.Model):
         if not self.total:
             self.total = self.entrega.total
         super().save(*args, **kwargs)
+
+    class Meta:
+        ordering = ['-fecha_emision', '-creado_en']
 
     @staticmethod
     def _generar_numero():

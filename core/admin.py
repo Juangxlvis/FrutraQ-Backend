@@ -2,7 +2,7 @@ from django.contrib import admin
 from .models import (
     Producto, Proveedor, Cliente, PrecioCliente,
     Viaje, PuntoRecoleccion, LoteCarga,
-    Entrega, DetalleEntrega, Factura,
+    Entrega, DetalleEntrega, Factura, Configuracion,
 )
 
 admin.site.register(Producto)
@@ -15,3 +15,4 @@ admin.site.register(LoteCarga)
 admin.site.register(Entrega)
 admin.site.register(DetalleEntrega)
 admin.site.register(Factura)
+admin.site.register(Configuracion)

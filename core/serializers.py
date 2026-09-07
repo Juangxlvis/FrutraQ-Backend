@@ -1,12 +1,13 @@
 from decimal import Decimal
-from django.db.models import Sum
+from django.db.models import Sum, F
 from rest_framework import serializers
 from .models import (
     Producto, Proveedor, Cliente, PrecioCliente,
     Viaje, PuntoRecoleccion, LoteCarga,
-    Entrega, DetalleEntrega, Factura,
-    TipoServicio, Calidad,
+    Entrega, DetalleEntrega, Factura, Configuracion,
+    TipoServicio, Calidad, EstadoViaje,
 )
+
 
 class ProductoSerializer(serializers.ModelSerializer):
     class Meta:
@@ -40,6 +41,12 @@ class PrecioClienteSerializer(serializers.ModelSerializer):
             'precio_kg', 'vigente_desde', 'creado_en',
         ]
 
+
+class ConfiguracionSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Configuracion
+        fields = ['id', 'margen_flete_kg_defecto']
+
 class ViajeSerializer(serializers.ModelSerializer):
     total_recolectado_kg = serializers.SerializerMethodField()
     total_entregado = serializers.SerializerMethodField()
@@ -68,23 +75,14 @@ class ViajeSerializer(serializers.ModelSerializer):
 class PuntoRecoleccionSerializer(serializers.ModelSerializer):
     class Meta:
         model = PuntoRecoleccion
-        fields = ['id', 'viaje', 'proveedor', 'orden', 'tipo_servicio', 'precio_flete_kg']
+        fields = ['id', 'viaje', 'proveedor', 'orden', 'tipo_servicio', 'margen_flete_kg']
 
-    def validate(self, data):
-        # Durante un PATCH parcial, 'data' solo trae los campos que cambiaron.
-        # Por eso, si un campo no viene en 'data', hay que rescatarlo del
-        # objeto ya existente (self.instance) — si no, esta validación
-        # se rompería en cualquier actualización parcial.
-        tipo = data.get('tipo_servicio', getattr(self.instance, 'tipo_servicio', None))
-        precio = data.get('precio_flete_kg', getattr(self.instance, 'precio_flete_kg', None))
-
-        if tipo == TipoServicio.FLETE and not precio:
+    def validate_viaje(self, viaje):
+        if self.instance is None and viaje.estado != EstadoViaje.RECOLECCION:
             raise serializers.ValidationError(
-                {'precio_flete_kg': 'Se requiere cuando el tipo de servicio es FLETE.'}
+                'Solo se pueden agregar paradas mientras el viaje está en recolección.'
             )
-        if tipo == TipoServicio.COMPRA:
-            data['precio_flete_kg'] = None
-        return data
+        return viaje
 
 
 class LoteCargaSerializer(serializers.ModelSerializer):
@@ -107,13 +105,37 @@ class LoteCargaSerializer(serializers.ModelSerializer):
         if value <= 0:
             raise serializers.ValidationError('El peso debe ser mayor a 0.')
         return value
+    
+    def validate(self, data):
+        punto = data.get('punto_recoleccion', getattr(self.instance, 'punto_recoleccion', None))
+        precio = data.get('precio_compra_kg', getattr(self.instance, 'precio_compra_kg', None))
+        if punto and punto.tipo_servicio == TipoServicio.COMPRA and not precio:
+            raise serializers.ValidationError(
+                {'precio_compra_kg': 'Se requiere el precio de compra cuando la parada es tipo COMPRA.'}
+            )
+        return data
+
 
 class EntregaSerializer(serializers.ModelSerializer):
-    total = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
+    total = serializers.ReadOnlyField()
+    factura_id = serializers.SerializerMethodField()
 
     class Meta:
         model = Entrega
-        fields = ['id', 'viaje', 'cliente', 'fecha_entrega', 'estado_pago', 'notas', 'creado_en', 'total']
+        fields = ['id', 'viaje', 'cliente', 'fecha_entrega', 'estado_pago', 'notas', 'creado_en', 'total', 'factura_id']
+
+    def get_factura_id(self, obj):
+        try:
+            return str(obj.factura.id)
+        except Entrega.factura.RelatedObjectDoesNotExist:
+            return None
+
+    def validate_viaje(self, viaje):
+        if self.instance is None and viaje.estado != EstadoViaje.TRANSITO:
+            raise serializers.ValidationError(
+                'Solo se pueden registrar entregas mientras el viaje está en tránsito.'
+            )
+        return viaje
 
 
 class FacturaSerializer(serializers.ModelSerializer):
@@ -122,26 +144,42 @@ class FacturaSerializer(serializers.ModelSerializer):
         fields = ['id', 'entrega', 'numero_factura', 'fecha_emision', 'total', 'notas', 'pdf_url', 'creado_en']
         read_only_fields = ['numero_factura', 'fecha_emision', 'total']
 
+
 class DetalleEntregaSerializer(serializers.ModelSerializer):
-    """Para LEER — muestra todo, incluidos los precios ya calculados."""
+    """Para LEER — muestra todo, incluidos precios, margen y lo que le corresponde al proveedor."""
+    subtotal_proveedor = serializers.ReadOnlyField()
+
     class Meta:
         model = DetalleEntrega
         fields = [
-            'id', 'entrega', 'producto',
+            'id', 'entrega', 'punto_recoleccion', 'producto',
             'kg_primera_recibida', 'kg_segunda_recibida',
             'precio_primera_kg', 'precio_segunda_kg', 'subtotal',
+            'margen_kg', 'subtotal_proveedor',
         ]
         read_only_fields = ['precio_primera_kg', 'precio_segunda_kg', 'subtotal']
 
 
 class DetalleEntregaCreateSerializer(serializers.ModelSerializer):
     """
-    Para CREAR — el cliente solo manda producto y kilos.
+    Para CREAR — el cliente manda parada de origen, producto y kilos.
     Los precios se buscan internamente en PrecioCliente.precio_vigente().
+    El disponible se controla por PARADA + producto (no por viaje completo),
+    para atribuir correctamente el pago a cada proveedor. El margen toma
+    el valor configurado por defecto si no se manda uno explícito.
     """
     class Meta:
         model = DetalleEntrega
-        fields = ['id', 'entrega', 'producto', 'kg_primera_recibida', 'kg_segunda_recibida']
+        fields = [
+            'id', 'entrega', 'punto_recoleccion', 'producto',
+            'kg_primera_recibida', 'kg_segunda_recibida', 'margen_kg',
+            'precio_primera_kg', 'precio_segunda_kg', 'subtotal', 'subtotal_proveedor',
+        ]
+        read_only_fields = ['precio_primera_kg', 'precio_segunda_kg', 'subtotal', 'subtotal_proveedor']
+        extra_kwargs = {
+            'margen_kg': {'required': False},
+            'punto_recoleccion': {'required': True, 'allow_null': False},
+        }
 
     def validate(self, data):
         kg_primera = data.get('kg_primera_recibida', Decimal('0'))
@@ -153,14 +191,30 @@ class DetalleEntregaCreateSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError('Debe ingresar al menos kg de primera o de segunda.')
 
         entrega = data['entrega']
+        punto = data['punto_recoleccion']
         producto = data['producto']
+
+        if punto.viaje_id != entrega.viaje_id:
+            raise serializers.ValidationError('La parada seleccionada no pertenece al viaje de esta entrega.')
+
+        total_solicitado = kg_primera + kg_segunda
+        recolectado = LoteCarga.objects.filter(
+            punto_recoleccion=punto, producto=producto
+        ).aggregate(t=Sum('peso_recoleccion_kg'))['t'] or Decimal('0')
+        ya_entregado = DetalleEntrega.objects.filter(
+            punto_recoleccion=punto, producto=producto
+        ).aggregate(t=Sum(F('kg_primera_recibida') + F('kg_segunda_recibida')))['t'] or Decimal('0')
+        disponible = recolectado - ya_entregado
+
+        if total_solicitado > disponible:
+            raise serializers.ValidationError(
+                f'Solo quedan {disponible} kg disponibles de {producto.nombre} de esta parada.'
+            )
 
         if kg_primera > 0:
             precio = PrecioCliente.precio_vigente(entrega.cliente_id, producto.id, Calidad.PRIMERA)
             if not precio:
-                raise serializers.ValidationError(
-                    f'No hay precio de PRIMERA configurado para {entrega.cliente} y {producto}.'
-                )
+                raise serializers.ValidationError(f'No hay precio de PRIMERA configurado para {entrega.cliente} y {producto}.')
             data['precio_primera_kg'] = precio.precio_kg
         else:
             data['precio_primera_kg'] = Decimal('0.00')
@@ -168,11 +222,15 @@ class DetalleEntregaCreateSerializer(serializers.ModelSerializer):
         if kg_segunda > 0:
             precio = PrecioCliente.precio_vigente(entrega.cliente_id, producto.id, Calidad.SEGUNDA)
             if not precio:
-                raise serializers.ValidationError(
-                    f'No hay precio de SEGUNDA configurado para {entrega.cliente} y {producto}.'
-                )
+                raise serializers.ValidationError(f'No hay precio de SEGUNDA configurado para {entrega.cliente} y {producto}.')
             data['precio_segunda_kg'] = precio.precio_kg
         else:
             data['precio_segunda_kg'] = Decimal('0.00')
+
+        if punto.tipo_servicio == TipoServicio.FLETE:
+                        if data.get('margen_kg') is None:
+                            data['margen_kg'] = punto.margen_flete_kg or Configuracion.obtener().margen_flete_kg_defecto
+        else:
+            data['margen_kg'] = Decimal('0.00')
 
         return data
