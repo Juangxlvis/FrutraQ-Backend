@@ -6,14 +6,14 @@ from rest_framework.response import Response
 from rest_framework.exceptions import ValidationError
 
 from .models import (
-    Producto, Proveedor, Cliente, PrecioCliente,
+    LiquidacionProveedor, Producto, Proveedor, Cliente, PrecioCliente,
     Viaje, PuntoRecoleccion, LoteCarga,
     Entrega, DetalleEntrega, Factura, Configuracion,
     EstadoViaje, EstadoPago, TipoServicio,
 )
 
 from .serializers import (
-    ProductoSerializer, ProveedorSerializer, ClienteSerializer, PrecioClienteSerializer,
+    LiquidacionProveedorSerializer, ProductoSerializer, ProveedorSerializer, ClienteSerializer, PrecioClienteSerializer,
     ConfiguracionSerializer,
     ViajeSerializer, PuntoRecoleccionSerializer, LoteCargaSerializer,
     EntregaSerializer, DetalleEntregaSerializer, DetalleEntregaCreateSerializer,
@@ -127,6 +127,7 @@ class ViajeViewSet(viewsets.ModelViewSet):
                 'pagado_proveedor': str(pagado) if pagado is not None else None,
                 'ganancia_transportador': str(ganancia) if ganancia is not None else None,
                 'margen_flete_kg': str(punto.margen_flete_kg) if (punto and punto.margen_flete_kg is not None) else None,
+                'proveedor_id': str(punto.proveedor_id) if punto else None,
             })
 
             acumulado = resumen_global.setdefault(producto_id, {
@@ -144,7 +145,43 @@ class ViajeViewSet(viewsets.ModelViewSet):
             }
             for pid, v in resumen_global.items()
         ]
-        return {'detalle_por_proveedor': detalle_por_proveedor, 'resumen_global': resumen}
+
+        resumen_proveedor = {}
+        for linea in detalle_por_proveedor:
+            pid = linea['proveedor_id']
+            if pid is None:
+                continue
+            acc = resumen_proveedor.setdefault(pid, {
+                'proveedor_nombre': linea['proveedor_nombre'],
+                'recolectado_kg': Decimal('0'), 'entregado_kg': Decimal('0'),
+                'cobrado_cliente': Decimal('0'), 'pagado_proveedor': Decimal('0'),
+            })
+            acc['recolectado_kg'] += Decimal(linea['recolectado_kg'])
+            acc['entregado_kg'] += Decimal(linea['entregado_kg'])
+            acc['cobrado_cliente'] += Decimal(linea['cobrado_cliente'])
+            if linea['pagado_proveedor'] is not None:
+                acc['pagado_proveedor'] += Decimal(linea['pagado_proveedor'])
+
+        liquidaciones = {
+            str(l.proveedor_id): l for l in LiquidacionProveedor.objects.filter(viaje=viaje)
+        }
+        resumen_por_proveedor = [
+            {
+                'proveedor_id': pid,
+                'proveedor_nombre': acc['proveedor_nombre'],
+                'recolectado_kg': str(acc['recolectado_kg']),
+                'entregado_kg': str(acc['entregado_kg']),
+                'cobrado_cliente': str(acc['cobrado_cliente']),
+                'pagado_proveedor': str(acc['pagado_proveedor']),
+                'ganancia_transportador': str(acc['cobrado_cliente'] - acc['pagado_proveedor']),
+                'liquidacion_id': str(liquidaciones[pid].id) if pid in liquidaciones else None,
+                'liquidacion_numero': liquidaciones[pid].numero_liquidacion if pid in liquidaciones else None,
+                'liquidacion_estado': liquidaciones[pid].estado_pago if pid in liquidaciones else None,
+            }
+            for pid, acc in resumen_proveedor.items()
+        ]
+
+        return {'detalle_por_proveedor': detalle_por_proveedor, 'resumen_global': resumen, 'resumen_por_proveedor': resumen_por_proveedor}
     
     @action(detail=True, methods=['get'])
     def inventario(self, request, pk=None):
@@ -251,3 +288,15 @@ class FacturaViewSet(viewsets.ModelViewSet):
         factura.entrega.estado_pago = EstadoPago.PAGADO
         factura.entrega.save(update_fields=['estado_pago'])
         return Response(FacturaSerializer(factura).data)
+
+class LiquidacionProveedorViewSet(viewsets.ModelViewSet):
+    queryset = LiquidacionProveedor.objects.all()
+    serializer_class = LiquidacionProveedorSerializer
+    filterset_fields = ['viaje', 'proveedor', 'estado_pago']
+
+    @action(detail=True, methods=['post'], url_path='marcar-pagado')
+    def marcar_pagado(self, request, pk=None):
+        liquidacion = self.get_object()
+        liquidacion.estado_pago = EstadoPago.PAGADO
+        liquidacion.save(update_fields=['estado_pago'])
+        return Response(LiquidacionProveedorSerializer(liquidacion).data)

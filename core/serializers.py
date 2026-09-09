@@ -2,7 +2,7 @@ from decimal import Decimal
 from django.db.models import Sum, F
 from rest_framework import serializers
 from .models import (
-    Producto, Proveedor, Cliente, PrecioCliente,
+    LiquidacionProveedor, Producto, Proveedor, Cliente, PrecioCliente,
     Viaje, PuntoRecoleccion, LoteCarga,
     Entrega, DetalleEntrega, Factura, Configuracion,
     TipoServicio, Calidad, EstadoViaje,
@@ -234,3 +234,9 @@ class DetalleEntregaCreateSerializer(serializers.ModelSerializer):
             data['margen_kg'] = Decimal('0.00')
 
         return data
+
+class LiquidacionProveedorSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = LiquidacionProveedor
+        fields = ['id', 'viaje', 'proveedor', 'numero_liquidacion', 'fecha_emision', 'estado_pago', 'total', 'notas', 'creado_en']
+        read_only_fields = ['numero_liquidacion', 'fecha_emision', 'total']

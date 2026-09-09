@@ -305,3 +305,55 @@ class Factura(models.Model):
 
     def __str__(self):
         return self.numero_factura
+
+class LiquidacionProveedor(models.Model):
+    """
+    Liquidación de lo que se le debe a un proveedor por UN viaje completo —
+    agrega todas sus paradas de ese viaje (FLETE y/o COMPRA) en un solo total.
+    Es el equivalente de Factura, pero mirando hacia el proveedor, no el cliente.
+    """
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    viaje = models.ForeignKey(Viaje, on_delete=models.CASCADE, related_name='liquidaciones')
+    proveedor = models.ForeignKey(Proveedor, on_delete=models.PROTECT)
+    numero_liquidacion = models.CharField(max_length=20, unique=True, blank=True)
+    fecha_emision = models.DateField(auto_now_add=True)
+    estado_pago = models.CharField(max_length=10, choices=EstadoPago.choices, default=EstadoPago.PENDIENTE)
+    total = models.DecimalField(max_digits=12, decimal_places=2, blank=True, default=Decimal('0.00'))
+    notas = models.TextField(blank=True)
+    creado_en = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        unique_together = [('viaje', 'proveedor')]
+        ordering = ['-fecha_emision', '-creado_en']
+
+    def save(self, *args, **kwargs):
+        if not self.numero_liquidacion:
+            self.numero_liquidacion = self._generar_numero()
+        if not self.total:
+            self.total = self._calcular_total()
+        super().save(*args, **kwargs)
+
+    def _calcular_total(self):
+        from django.db.models import Sum, F
+        total = Decimal('0.00')
+        paradas = PuntoRecoleccion.objects.filter(viaje=self.viaje, proveedor=self.proveedor)
+        for punto in paradas:
+            if punto.tipo_servicio == TipoServicio.FLETE:
+                agregado = DetalleEntrega.objects.filter(punto_recoleccion=punto).aggregate(
+                    t=Sum(F('subtotal') - F('margen_kg') * (F('kg_primera_recibida') + F('kg_segunda_recibida')))
+                )['t']
+            else:
+                agregado = LoteCarga.objects.filter(punto_recoleccion=punto).aggregate(
+                    t=Sum(F('precio_compra_kg') * F('peso_recoleccion_kg'))
+                )['t']
+            total += agregado or Decimal('0.00')
+        return total
+
+    @staticmethod
+    def _generar_numero():
+        anio = date.today().year
+        ultimo = LiquidacionProveedor.objects.filter(numero_liquidacion__startswith=f'LIQ-{anio}-').count()
+        return f'LIQ-{anio}-{str(ultimo + 1).zfill(4)}'
+
+    def __str__(self):
+        return self.numero_liquidacion
