@@ -35,8 +35,10 @@ class EstadoPago(models.TextChoices):
 class Configuracion(models.Model):
     margen_flete_kg_defecto = models.DecimalField(
         max_digits=8, decimal_places=2, default=Decimal('500.00'),
-        help_text='Margen por kg que se precarga en entregas de paradas tipo FLETE — la ganancia del transportador, calculada al momento de entregar.'
+        help_text='Margen por kg que se precarga en entregas de paradas tipo FLETE.'
     )
+    nombre_negocio = models.CharField(max_length=150, blank=True, default='FrutraQ')
+    telefono_contacto = models.CharField(max_length=20, blank=True)
 
     class Meta:
         verbose_name = 'Configuración general'
@@ -347,7 +349,7 @@ class LiquidacionProveedor(models.Model):
                     t=Sum(F('precio_compra_kg') * F('peso_recoleccion_kg'))
                 )['t']
             total += agregado or Decimal('0.00')
-        return total
+        return total.quantize(Decimal('0.01'))
 
     @staticmethod
     def _generar_numero():

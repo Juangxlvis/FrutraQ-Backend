@@ -9,11 +9,11 @@ from .models import (
     LiquidacionProveedor, Producto, Proveedor, Cliente, PrecioCliente,
     Viaje, PuntoRecoleccion, LoteCarga,
     Entrega, DetalleEntrega, Factura, Configuracion,
-    EstadoViaje, EstadoPago, TipoServicio,
+    EstadoViaje, EstadoPago, TipoServicio, Calidad,
 )
 
 from .serializers import (
-    LiquidacionProveedorSerializer, ProductoSerializer, ProveedorSerializer, ClienteSerializer, PrecioClienteSerializer,
+    DetalleEntregaUpdateSerializer, LiquidacionProveedorSerializer, ProductoSerializer, ProveedorSerializer, ClienteSerializer, PrecioClienteSerializer,
     ConfiguracionSerializer,
     ViajeSerializer, PuntoRecoleccionSerializer, LoteCargaSerializer,
     EntregaSerializer, DetalleEntregaSerializer, DetalleEntregaCreateSerializer,
@@ -72,22 +72,32 @@ class ViajeViewSet(viewsets.ModelViewSet):
         viaje.save(update_fields=['estado', 'actualizado_en'])
 
     def _calcular_inventario(self, viaje):
+        Q2 = Decimal('0.01')
         lotes = LoteCarga.objects.filter(punto_recoleccion__viaje=viaje)
         detalles = DetalleEntrega.objects.filter(punto_recoleccion__viaje=viaje).select_related('punto_recoleccion')
 
         recolectado = {}
+        recolectado_primera = {}
+        recolectado_segunda = {}
         pagado_compra = {}
         for lote in lotes:
             clave = (str(lote.punto_recoleccion_id), str(lote.producto_id))
             recolectado[clave] = recolectado.get(clave, Decimal('0')) + lote.peso_recoleccion_kg
+            if lote.calidad == Calidad.PRIMERA:
+                recolectado_primera[clave] = recolectado_primera.get(clave, Decimal('0')) + lote.peso_recoleccion_kg
+            else:
+                recolectado_segunda[clave] = recolectado_segunda.get(clave, Decimal('0')) + lote.peso_recoleccion_kg
             if lote.precio_compra_kg:
                 pagado_compra[clave] = pagado_compra.get(clave, Decimal('0')) + (lote.precio_compra_kg * lote.peso_recoleccion_kg)
 
-        entregado_kg, cobrado_cliente, pagado_flete = {}, {}, {}
+        entregado_kg, entregado_primera, entregado_segunda = {}, {}, {}
+        cobrado_cliente, pagado_flete = {}, {}
         for d in detalles:
             clave = (str(d.punto_recoleccion_id), str(d.producto_id))
             total_kg = d.kg_primera_recibida + d.kg_segunda_recibida
             entregado_kg[clave] = entregado_kg.get(clave, Decimal('0')) + total_kg
+            entregado_primera[clave] = entregado_primera.get(clave, Decimal('0')) + d.kg_primera_recibida
+            entregado_segunda[clave] = entregado_segunda.get(clave, Decimal('0')) + d.kg_segunda_recibida
             cobrado_cliente[clave] = cobrado_cliente.get(clave, Decimal('0')) + d.subtotal
             if d.subtotal_proveedor is not None:
                 pagado_flete[clave] = pagado_flete.get(clave, Decimal('0')) + d.subtotal_proveedor
@@ -112,22 +122,30 @@ class ViajeViewSet(viewsets.ModelViewSet):
             else:
                 pagado = None
 
-            ganancia = (cobrado - pagado) if pagado is not None else None
+            if pagado is not None:
+                pagado = pagado.quantize(Q2)
+            ganancia = (cobrado - pagado).quantize(Q2) if pagado is not None else None
+            tarifa_efectiva = (pagado / rec).quantize(Q2) if (pagado is not None and rec > 0) else None
 
             detalle_por_proveedor.append({
                 'punto_recoleccion_id': punto_id,
+                'proveedor_id': str(punto.proveedor_id) if punto else None,
                 'proveedor_nombre': punto.proveedor.nombre if punto else '?',
                 'tipo_servicio': punto.tipo_servicio if punto else None,
                 'producto_id': producto_id,
                 'producto_nombre': productos_map.get(producto_id, '?'),
                 'recolectado_kg': str(rec),
+                'recolectado_primera_kg': str(recolectado_primera.get((punto_id, producto_id), Decimal('0'))),
+                'recolectado_segunda_kg': str(recolectado_segunda.get((punto_id, producto_id), Decimal('0'))),
                 'entregado_kg': str(ent),
+                'entregado_primera_kg': str(entregado_primera.get((punto_id, producto_id), Decimal('0'))),
+                'entregado_segunda_kg': str(entregado_segunda.get((punto_id, producto_id), Decimal('0'))),
                 'disponible_kg': str(rec - ent),
                 'cobrado_cliente': str(cobrado),
                 'pagado_proveedor': str(pagado) if pagado is not None else None,
                 'ganancia_transportador': str(ganancia) if ganancia is not None else None,
                 'margen_flete_kg': str(punto.margen_flete_kg) if (punto and punto.margen_flete_kg is not None) else None,
-                'proveedor_id': str(punto.proveedor_id) if punto else None,
+                'tarifa_efectiva_kg': str(tarifa_efectiva) if tarifa_efectiva is not None else None,
             })
 
             acumulado = resumen_global.setdefault(producto_id, {
@@ -162,18 +180,16 @@ class ViajeViewSet(viewsets.ModelViewSet):
             if linea['pagado_proveedor'] is not None:
                 acc['pagado_proveedor'] += Decimal(linea['pagado_proveedor'])
 
-        liquidaciones = {
-            str(l.proveedor_id): l for l in LiquidacionProveedor.objects.filter(viaje=viaje)
-        }
+        liquidaciones = {str(l.proveedor_id): l for l in LiquidacionProveedor.objects.filter(viaje=viaje)}
         resumen_por_proveedor = [
             {
                 'proveedor_id': pid,
                 'proveedor_nombre': acc['proveedor_nombre'],
                 'recolectado_kg': str(acc['recolectado_kg']),
                 'entregado_kg': str(acc['entregado_kg']),
-                'cobrado_cliente': str(acc['cobrado_cliente']),
-                'pagado_proveedor': str(acc['pagado_proveedor']),
-                'ganancia_transportador': str(acc['cobrado_cliente'] - acc['pagado_proveedor']),
+                'cobrado_cliente': str(acc['cobrado_cliente'].quantize(Q2)),
+                'pagado_proveedor': str(acc['pagado_proveedor'].quantize(Q2)),
+                'ganancia_transportador': str((acc['cobrado_cliente'] - acc['pagado_proveedor']).quantize(Q2)),
                 'liquidacion_id': str(liquidaciones[pid].id) if pid in liquidaciones else None,
                 'liquidacion_numero': liquidaciones[pid].numero_liquidacion if pid in liquidaciones else None,
                 'liquidacion_estado': liquidaciones[pid].estado_pago if pid in liquidaciones else None,
@@ -181,7 +197,11 @@ class ViajeViewSet(viewsets.ModelViewSet):
             for pid, acc in resumen_proveedor.items()
         ]
 
-        return {'detalle_por_proveedor': detalle_por_proveedor, 'resumen_global': resumen, 'resumen_por_proveedor': resumen_por_proveedor}
+        return {
+            'detalle_por_proveedor': detalle_por_proveedor,
+            'resumen_global': resumen,
+            'resumen_por_proveedor': resumen_por_proveedor,
+        }
     
     @action(detail=True, methods=['get'])
     def inventario(self, request, pk=None):
@@ -274,6 +294,8 @@ class DetalleEntregaViewSet(viewsets.ModelViewSet):
     def get_serializer_class(self):
         if self.action == 'create':
             return DetalleEntregaCreateSerializer
+        if self.action in ('update', 'partial_update'):
+            return DetalleEntregaUpdateSerializer
         return DetalleEntregaSerializer
 
 

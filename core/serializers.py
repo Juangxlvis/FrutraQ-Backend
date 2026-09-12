@@ -45,10 +45,11 @@ class PrecioClienteSerializer(serializers.ModelSerializer):
 class ConfiguracionSerializer(serializers.ModelSerializer):
     class Meta:
         model = Configuracion
-        fields = ['id', 'margen_flete_kg_defecto']
+        fields = ['id', 'margen_flete_kg_defecto', 'nombre_negocio', 'telefono_contacto']
 
 class ViajeSerializer(serializers.ModelSerializer):
     total_recolectado_kg = serializers.SerializerMethodField()
+    total_entregado_kg = serializers.SerializerMethodField()
     total_entregado = serializers.SerializerMethodField()
 
     class Meta:
@@ -56,13 +57,19 @@ class ViajeSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'fecha_salida', 'vehiculo', 'estado', 'observaciones',
             'creado_en', 'actualizado_en',
-            'total_recolectado_kg', 'total_entregado',
+            'total_recolectado_kg', 'total_entregado_kg', 'total_entregado',
         ]
 
     def get_total_recolectado_kg(self, obj):
         total = LoteCarga.objects.filter(
             punto_recoleccion__viaje=obj
         ).aggregate(t=Sum('peso_recoleccion_kg'))['t']
+        return total or 0
+
+    def get_total_entregado_kg(self, obj):
+        total = DetalleEntrega.objects.filter(
+            entrega__viaje=obj
+        ).aggregate(t=Sum(F('kg_primera_recibida') + F('kg_segunda_recibida')))['t']
         return total or 0
 
     def get_total_entregado(self, obj):
@@ -77,12 +84,23 @@ class PuntoRecoleccionSerializer(serializers.ModelSerializer):
         model = PuntoRecoleccion
         fields = ['id', 'viaje', 'proveedor', 'orden', 'tipo_servicio', 'margen_flete_kg']
 
-    def validate_viaje(self, viaje):
-        if self.instance is None and viaje.estado != EstadoViaje.RECOLECCION:
+    def validate(self, data):
+        viaje = data.get('viaje') or (self.instance.viaje if self.instance else None)
+        if viaje and viaje.estado != EstadoViaje.RECOLECCION:
             raise serializers.ValidationError(
-                'Solo se pueden agregar paradas mientras el viaje está en recolección.'
+                'Las paradas solo se pueden crear o editar mientras el viaje está en recolección.'
             )
-        return viaje
+
+        if self.instance is not None and 'proveedor' in data and data['proveedor'] != self.instance.proveedor:
+            raise serializers.ValidationError(
+                {'proveedor': 'No se puede cambiar el proveedor de una parada ya creada.'}
+            )
+
+        tipo = data.get('tipo_servicio', getattr(self.instance, 'tipo_servicio', None))
+        if tipo == TipoServicio.COMPRA:
+            data['margen_flete_kg'] = None
+
+        return data
 
 
 class LoteCargaSerializer(serializers.ModelSerializer):
@@ -96,6 +114,21 @@ class LoteCargaSerializer(serializers.ModelSerializer):
             'peso_promedio_canastilla',
         ]
 
+    def validate(self, data):
+        punto = data.get('punto_recoleccion', getattr(self.instance, 'punto_recoleccion', None))
+        precio = data.get('precio_compra_kg', getattr(self.instance, 'precio_compra_kg', None))
+
+        if punto and punto.tipo_servicio == TipoServicio.COMPRA and not precio:
+            raise serializers.ValidationError(
+                {'precio_compra_kg': 'Se requiere el precio de compra cuando la parada es tipo COMPRA.'}
+            )
+        if punto and punto.viaje.estado != EstadoViaje.RECOLECCION:
+            raise serializers.ValidationError('Los lotes solo se pueden crear o editar mientras el viaje está en recolección.')
+        if punto and LiquidacionProveedor.objects.filter(viaje=punto.viaje, proveedor=punto.proveedor).exists():
+            raise serializers.ValidationError('Ya se generó una liquidación para este proveedor en este viaje — no se puede editar la recolección.')
+
+        return data
+
     def validate_num_canastillas(self, value):
         if value <= 0:
             raise serializers.ValidationError('Debe ser mayor a 0.')
@@ -105,15 +138,6 @@ class LoteCargaSerializer(serializers.ModelSerializer):
         if value <= 0:
             raise serializers.ValidationError('El peso debe ser mayor a 0.')
         return value
-    
-    def validate(self, data):
-        punto = data.get('punto_recoleccion', getattr(self.instance, 'punto_recoleccion', None))
-        precio = data.get('precio_compra_kg', getattr(self.instance, 'precio_compra_kg', None))
-        if punto and punto.tipo_servicio == TipoServicio.COMPRA and not precio:
-            raise serializers.ValidationError(
-                {'precio_compra_kg': 'Se requiere el precio de compra cuando la parada es tipo COMPRA.'}
-            )
-        return data
 
 
 class EntregaSerializer(serializers.ModelSerializer):
@@ -230,6 +254,84 @@ class DetalleEntregaCreateSerializer(serializers.ModelSerializer):
         if punto.tipo_servicio == TipoServicio.FLETE:
                         if data.get('margen_kg') is None:
                             data['margen_kg'] = punto.margen_flete_kg or Configuracion.obtener().margen_flete_kg_defecto
+        else:
+            data['margen_kg'] = Decimal('0.00')
+
+        return data
+
+class DetalleEntregaUpdateSerializer(serializers.ModelSerializer):
+    """
+    Para EDITAR un detalle ya creado — corrige errores de digitación.
+    Solo mientras el viaje sigue en TRANSITO y no exista factura para esa
+    entrega. A diferencia del snapshot original, SÍ vuelve a consultar el
+    precio vigente actual — se asume que el registro original fue un error,
+    no un hecho histórico ya facturado (si ya hay factura, queda bloqueado).
+    """
+    subtotal_proveedor = serializers.ReadOnlyField()
+
+    class Meta:
+        model = DetalleEntrega
+        fields = [
+            'id', 'kg_primera_recibida', 'kg_segunda_recibida', 'margen_kg',
+            'precio_primera_kg', 'precio_segunda_kg', 'subtotal', 'subtotal_proveedor',
+        ]
+        read_only_fields = ['precio_primera_kg', 'precio_segunda_kg', 'subtotal', 'subtotal_proveedor']
+
+    def validate(self, data):
+        instancia = self.instance
+        entrega = instancia.entrega
+        punto = instancia.punto_recoleccion
+        producto = instancia.producto
+
+        if entrega.viaje.estado != EstadoViaje.TRANSITO:
+            raise serializers.ValidationError('Solo se puede editar mientras el viaje está en tránsito.')
+
+        try:
+            entrega.factura
+            raise serializers.ValidationError('Ya se generó una factura para esta entrega — no se puede editar.')
+        except Entrega.factura.RelatedObjectDoesNotExist:
+            pass
+
+        kg_primera = data.get('kg_primera_recibida', instancia.kg_primera_recibida)
+        kg_segunda = data.get('kg_segunda_recibida', instancia.kg_segunda_recibida)
+
+        if kg_primera < 0 or kg_segunda < 0:
+            raise serializers.ValidationError('Los kilogramos no pueden ser negativos.')
+        if kg_primera == 0 and kg_segunda == 0:
+            raise serializers.ValidationError('Debe ingresar al menos kg de primera o de segunda.')
+
+        recolectado = LoteCarga.objects.filter(punto_recoleccion=punto, producto=producto).aggregate(
+            t=Sum('peso_recoleccion_kg')
+        )['t'] or Decimal('0')
+        ya_entregado_otros = DetalleEntrega.objects.filter(
+            punto_recoleccion=punto, producto=producto
+        ).exclude(pk=instancia.pk).aggregate(
+            t=Sum(F('kg_primera_recibida') + F('kg_segunda_recibida'))
+        )['t'] or Decimal('0')
+        disponible = recolectado - ya_entregado_otros
+
+        if (kg_primera + kg_segunda) > disponible:
+            raise serializers.ValidationError(f'Solo quedan {disponible} kg disponibles de {producto.nombre} de esta parada.')
+
+        if kg_primera > 0:
+            precio = PrecioCliente.precio_vigente(entrega.cliente_id, producto.id, Calidad.PRIMERA)
+            if not precio:
+                raise serializers.ValidationError(f'No hay precio de PRIMERA configurado para {entrega.cliente} y {producto}.')
+            data['precio_primera_kg'] = precio.precio_kg
+        else:
+            data['precio_primera_kg'] = Decimal('0.00')
+
+        if kg_segunda > 0:
+            precio = PrecioCliente.precio_vigente(entrega.cliente_id, producto.id, Calidad.SEGUNDA)
+            if not precio:
+                raise serializers.ValidationError(f'No hay precio de SEGUNDA configurado para {entrega.cliente} y {producto}.')
+            data['precio_segunda_kg'] = precio.precio_kg
+        else:
+            data['precio_segunda_kg'] = Decimal('0.00')
+
+        if punto.tipo_servicio == TipoServicio.FLETE:
+            if data.get('margen_kg') is None:
+                data['margen_kg'] = punto.margen_flete_kg or Configuracion.obtener().margen_flete_kg_defecto
         else:
             data['margen_kg'] = Decimal('0.00')
 
